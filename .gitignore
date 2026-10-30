@@ -1,0 +1,3 @@
+# Model weights are downloaded locally (see README); keep the dir, ignore contents
+models/*
+!models/.gitkeep

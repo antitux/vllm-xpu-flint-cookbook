@@ -1,0 +1,127 @@
+# ============================================================================
+# FLINT STACK 
+#
+# FLINT-SPECIFIC PRE-FLIGHT:
+#   - Weights: ./models/RecursiveSI/flint (75 GB, 15 shards)
+#   - #63986 one-line patch applied to ./patches/flint/norm.py
+#   - XPU import patch applied to ./patches/flint/moe.py
+#     (`from __future__ import annotations` — fixes the
+#     `torch.cuda.Event | None` import-time crash on XPU)
+#   - XPU flashinfer patch applied to ./patches/flint/model.py
+#     (FlintAttention unconditionally imports the flashinfer backend + asserts
+#     FlashInferImpl, but the XPU image has no flashinfer and uses TRITON_ATTN;
+#     patch computes flint_decode first and only imports FlashInfer when True)
+#   - ALL THREE are mounted onto the INSTALLED copy at
+#     /opt/venv/lib/python3.12/site-packages/vllm/... (the path the worker
+#     actually imports). The image also has a /workspace/vllm source checkout
+#     — mounting there is a no-op; that was the 1st-run failure.
+# ============================================================================
+
+services:
+  flint:
+    # Official XPU nightly (2026-10-30) — first to ship vllm/models/flint/
+    # (PR #62938). Re-check for a newer nightly before running; a newer one
+    # may already include #63986 (drop the norm.py mount) and #63957 (a
+    # dedicated `flint` parser — then swap the glm47 parsers below for `flint`).
+    image: vllm/vllm-openai-xpu:nightly-335dd77b09161c5d63139b4e7ae51bb9928305b1
+    container_name: flint 
+    restart: unless-stopped
+    ipc: host
+    privileged: true
+    working_dir: /
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - /dev/dri:/dev/dri
+      # Flint BF16 weights (local).
+      # Download with `hf download RecursiveSI/flint --local-dir /full/path/to/models/RecursiveSI/flint`
+      - ./models/RecursiveSI/flint:/model:ro
+      # CRITICAL: the worker imports vllm from the INSTALLED copy at
+      # /opt/venv/lib/python3.12/site-packages/vllm (NOT the /workspace/vllm
+      # source checkout — mounting there had no effect; see 2026-10-30 debug).
+      # PR #63986 one-line fix (silu_and_mul TP-shard crash).
+      - ./patches/flint/norm.py:/opt/venv/lib/python3.12/site-packages/vllm/models/flint/ops/norm.py:ro
+      # XPU import fix: moe.py uses `torch.cuda.Event | None` in signatures,
+      # which crashes at import on XPU (torch.cuda is a lazy function there).
+      # Patch adds `from __future__ import annotations` so annotations are
+      # never evaluated at import.
+      - ./patches/flint/moe.py:/opt/venv/lib/python3.12/site-packages/vllm/models/flint/ops/moe.py:ro
+      # XPU flashinfer fix: model.py's FlintAttention unconditionally imports
+      # the flashinfer backend + asserts isinstance(impl, FlashInferImpl), but
+      # the XPU image has no flashinfer and uses TRITON_ATTN. Patch computes
+      # flint_decode FIRST (False on XPU) and only imports/asserts FlashInfer
+      # when it's True — so XPU skips it and uses stock unified attention.
+      - ./patches/flint/model.py:/opt/venv/lib/python3.12/site-packages/vllm/models/flint/model.py:ro
+    group_add:
+      - 107
+    ports:
+      - "8000:8000"
+    shm_size: 32g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    environment:
+      # --- XPU device binding ---
+      - VLLM_TARGET_DEVICE=xpu
+      - ZE_FLAT_DEVICE_HIERARCHY=FLAT
+      - ZE_AFFINITY_MASK=0,1,2,3
+      - B70_WORKER_AFFINITY=1
+      # --- oneCCL loopback pinning (cookbook fix; prevents ranks pairing on
+      #     wifi vs docker-bridge and hanging at startup) ---
+      - CCL_KVS_IFACE=lo
+      - FI_TCP_IFACE=lo
+      - VLLM_HOST_IP=127.0.0.1
+      - CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD=4294967296
+      - CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD=4294967296
+      - CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD=4294967296
+      - CCL_SYCL_ALLTOALL_TMP_BUF=1
+      # --- XPU graph capture is mandatory (cookbook: eager was ~6x slower) ---
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - VLLM_XPU_ENABLE_XPU_GRAPH=1
+      # If the nightly's Rust frontend rejects any flag below, add:
+      # - VLLM_USE_RUST_FRONTEND=0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 15s
+      retries: 60
+      # 75 GB local load + 49-layer 4-rank graph capture: give it room.
+      start_period: 1800s
+    entrypoint: ["bash"]
+    command:
+      - -lc
+      - |
+        set -e
+        # NOTE: keep this a single backslash-continued command — a bare `#`
+        # comment line in the MIDDLE of the continuation silently ends the
+        # command (bash treats the comment as a non-continuing line), so any
+        # flags after it are dropped. That was the run-7 bug: everything after
+        # --dtype was lost, so --attention-backend TRITON_ATTN never reached
+        # the engine and vLLM auto-picked Flash Attention (FA2 paged_decode
+        # crash). Comments must go ABOVE the exec, not inside it.
+        #
+        # Flag notes:
+        #   --kv-cache-dtype auto: Flint's FlintAttention asserts
+        #     kv_cache_dtype in ("auto","bfloat16"); its fused
+        #     qk_norm_rope_cache kernel writes K/V in bf16, so fp8 KV is
+        #     unsupported (run-4 AssertionError). auto => bf16 for a bf16 model.
+        #   --attention-backend TRITON_ATTN: the XPU Flash Attention kernel is
+        #     precompiled without Flint's sliding-window+sink config
+        #     (8,128,64,false,true,true); Triton handles it natively.
+        exec vllm serve /model \
+          --served-model-name flint \
+          --tensor-parallel-size 4 \
+          --dtype bfloat16 \
+          --kv-cache-dtype auto \
+          --attention-backend TRITON_ATTN \
+          --max-model-len 262144 \
+          --max-num-seqs 16 \
+          --max-num-batched-tokens 8192 \
+          --gpu-memory-utilization 0.90 \
+          --port 8000 \
+          --trust-remote-code \
+          --enable-auto-tool-choice \
+          --tool-call-parser glm47 \
+          --reasoning-parser glm47
+
