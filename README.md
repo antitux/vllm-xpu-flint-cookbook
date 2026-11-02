@@ -121,7 +121,7 @@ Which one `import vllm` resolves to depends on the working directory. The `vllm 
 
 - 4x Intel Arc Pro B70 (or equivalent Xe2 XPU), each with at least ~20 GiB free.
 - Host render group `107` (the compose adds it via `group_add`).
-- The XPU nightly image, pulled automatically by `docker compose up`: `vllm/vllm-openai-xpu:nightly-335dd77b09161c5d63139b4e7ae51bb9928305b1`.
+- The XPU image, pulled automatically by `docker compose up`: `vllm/vllm-openai-xpu:v0.33.0'.
 
 ## Notes and caveats
 
