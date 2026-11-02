@@ -23,7 +23,7 @@ services:
     # (PR #62938). Re-check for a newer nightly before running; a newer one
     # may already include #63986 (drop the norm.py mount) and #63957 (a
     # dedicated `flint` parser — then swap the glm47 parsers below for `flint`).
-    image: vllm/vllm-openai-xpu:nightly-335dd77b09161c5d63139b4e7ae51bb9928305b1
+    image: vllm/vllm-openai-xpu:v0.33.0
     container_name: flint 
     restart: unless-stopped
     ipc: host
