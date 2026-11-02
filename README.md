@@ -1,4 +1,5 @@
 # Flint on Intel Arc Pro B70 (vLLM XPU)
+READ THIS ARTICLE FIRST: https://antitux.dev/software/2026/10/30/flint-on-arc-pro-b70/
 
 This runs [RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint), a 39.8B total / 2.5B active MoE decoder, on a box with 4x Intel Arc Pro B70 GPUs (32 GiB each). It uses the vLLM XPU nightly, BF16 weights, tensor parallelism across all 4 GPUs, and Triton for attention.
 
